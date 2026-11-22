@@ -1,0 +1,6 @@
+dist/
+outputs/
+.sites-runtime/
+.env*
+.dev.vars*
+.DS_Store

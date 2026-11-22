@@ -1,0 +1,31 @@
+// Local edition: IndexedDB holds real records and original file blobs.
+// No requests are presented as hosted writes or platform hot-ranking data.
+const localUUID=()=>globalThis.crypto?.randomUUID?.()||'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c==='x'?r:r&3|8).toString(16);});
+/*__VALIDATION__*/
+const localUrls=new Map();
+const localDB=new Promise((resolve,reject)=>{
+ try{
+  const r=indexedDB.open('tuntun-creative-vault-v1',1);
+  r.onupgradeneeded=()=>{const db=r.result;if(!db.objectStoreNames.contains('records'))db.createObjectStore('records',{keyPath:'id'});if(!db.objectStoreNames.contains('assets'))db.createObjectStore('assets',{keyPath:'key'});};
+  r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(new Error('浏览器未允许保存数据，请在 Chrome 或 Edge 中打开本地文件。'));
+ }catch{reject(new Error('浏览器未允许保存数据，请下载后在 Chrome 或 Edge 中打开。'));}
+});
+async function localReadAll(store){const db=await localDB;return new Promise((resolve,reject)=>{const r=db.transaction(store,'readonly').objectStore(store).getAll();r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});}
+async function warmAssets(){for(const a of await localReadAll('assets'))if(!localUrls.has(a.key))localUrls.set(a.key,URL.createObjectURL(a.blob));}
+async function localSave(input,id){const db=await localDB;return new Promise((resolve,reject)=>{const tx=db.transaction('records','readwrite'),store=tx.objectStore('records');const r=store.getAll();let output;
+ r.onsuccess=()=>{try{const previous=id?r.result.find(x=>x.id===id):undefined;if(id&&!previous)throw new AppError('这条素材不存在',404);if(previous&&input.expectedUpdatedAt!==previous.updatedAt)throw new AppError('素材已经更新，请重新打开后再编辑',409);const item=normalize(input,previous||{});if(!id&&item.url){const existing=r.result.find(x=>!x.archived&&x.type===item.type&&x.url&&canonicalUrl(x.url)===canonicalUrl(item.url));if(existing){output={item:existing,duplicate:true};return;}}store.put(item);output={item,duplicate:false};}catch(error){reject(error);tx.abort();}};
+ tx.oncomplete=()=>resolve(output);tx.onerror=()=>reject(new Error('保存未完成，可能是浏览器空间不足。请先导出备份。'));tx.onabort=()=>reject(new Error('这次保存未完成，请重试。'));
+});}
+async function localUpload(file,existingKey){if(!file||!file.size||file.size>MAX_FILE)throw new AppError('单个附件需大于 0 且不超过 100 MB');const safe=allowedFile(file.type,file.name);const key=existingKey||'assets/'+localUUID()+'/'+localUUID()+'.'+safe.ext;if(!/^assets\/[a-zA-Z0-9-]+\/[a-zA-Z0-9._-]+$/.test(key))throw new AppError('附件编号不正确');const data={key,name:file.name,type:safe.type,size:file.size,blob:file};const db=await localDB;await new Promise((resolve,reject)=>{const tx=db.transaction('assets','readwrite');tx.objectStore('assets').put(data);tx.oncomplete=resolve;tx.onerror=()=>reject(new Error('附件未保存，请检查浏览器剩余空间。'));});if(localUrls.has(key))URL.revokeObjectURL(localUrls.get(key));localUrls.set(key,URL.createObjectURL(file));return {key,name:file.name,type:safe.type,size:file.size};}
+async function localApi(path,options={}){const u=new URL(path,'https://local.test');const method=options.method||'GET';let body=options.body&&typeof options.body==='string'?JSON.parse(options.body):options.body;
+ if(u.pathname==='/api/items'&&method==='GET'){await warmAssets();const all=(await localReadAll('records')).sort((a,b)=>a.id.localeCompare(b.id));const offset=Number(u.searchParams.get('cursor'))||0;return {items:all.slice(offset,offset+100),cursor:offset+100<all.length?String(offset+100):null};}
+ if(u.pathname==='/api/items'&&method==='POST')return localSave(body);
+ const match=/^\/api\/items\/([a-zA-Z0-9-]+)$/.exec(u.pathname);if(match&&method==='PATCH')return localSave(body,match[1]);
+ if(u.pathname==='/api/upload'&&method==='POST')return localUpload(body.get('file'));
+ if(u.pathname==='/api/classify')return classify(u.searchParams.get('url'),u.searchParams.get('title'));
+ if(u.pathname==='/api/radar')return {query:body.query,searchedAt:new Date().toISOString(),sources:(body.sources||[]).map(s=>({source:s,name:{xhs:'小红书',instagram:'Instagram',wechat:'公众号'}[s],results:[],status:'unavailable',message:'本地版请使用上方站内搜索，聚合搜寻需要部署在线服务。'}))};
+ throw new AppError('本地版暂不支持此操作');
+}
+async function bytesBase64(blob){const bytes=new Uint8Array(await blob.arrayBuffer());const parts=[];for(let i=0;i<bytes.length;i+=8192)parts.push(String.fromCharCode(...bytes.subarray(i,i+8192)));return btoa(parts.join(''));}
+async function localExport(){if(loadError||loading)return toast('请先完成素材读取，再导出完整备份',true);try{toast('正在打包记录与附件，请稍等…');const assets=[];for(const a of await localReadAll('assets'))assets.push({key:a.key,name:a.name,type:a.type,size:a.size,contentBase64:await bytesBase64(a.blob)});const blob=new Blob([JSON.stringify({version:1,edition:'local',exportedAt:new Date().toISOString(),items,assets},null,2)],{type:'application/json'});const u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download='tuntun-complete-backup-'+new Date().toISOString().slice(0,10)+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(u),5000);toast('完整备份已导出，包含记录和附件原文件');}catch(e){toast('备份未完成：'+e.message,true);}}
+async function localImport(e){const file=e.target.files[0];if(!file)return;if(file.size>512*1024*1024)return toast('备份较大，请拆分为 512 MB 以内文件',true);let data;try{data=JSON.parse(await file.text());if(data.version!==1||!Array.isArray(data.items)||data.items.length>500||data.assets&&!Array.isArray(data.assets))throw new Error();}catch{return toast('请选择有效的囤囤屋 JSON 备份（最多 500 条记录）',true);}if(!confirm('导入 '+data.items.length+' 条记录及备份内附件？已有同类型链接会跳过。'))return;editingBusy=true;let added=0,skipped=0,failed=0,assetFailed=0;try{for(const a of data.assets||[]){try{if(typeof a.contentBase64!=='string'||a.contentBase64.length>140000000)throw new Error();const raw=atob(a.contentBase64);const bytes=Uint8Array.from(raw,c=>c.charCodeAt(0));await localUpload(new File([bytes],a.name,{type:a.type}),a.key);}catch{assetFailed++;}}for(const item of data.items){try{const d=await localSave(item);d.duplicate?skipped++:added++;mergeItem(d.item);}catch{failed++;}}}finally{editingBusy=false;}closeDrawer();render();toast('导入完成：新增 '+added+'，跳过 '+skipped+(failed?'，记录失败 '+failed:'')+(assetFailed?'，附件失败 '+assetFailed:''),failed+assetFailed>0);}
